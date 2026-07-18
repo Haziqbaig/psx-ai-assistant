@@ -5,8 +5,52 @@
  */
 const API = (() => {
   const YH = 'https://query2.finance.yahoo.com/v8/finance/chart';
+  const YH1 = 'https://query1.finance.yahoo.com/v8/finance/chart';
   const CACHE_PREFIX = 'ss_cache_';
   const DEFAULT_TTL = 120_000; // 2 min for intraday, longer for daily
+
+  // Yahoo Finance does NOT send CORS headers, so browser fetch is blocked cross-origin.
+  // We try a chain of transports: direct (in case of an extension / future CORS), then
+  // several public CORS proxies. The first that returns valid chart JSON wins, and the
+  // winning transport index is remembered for the session to speed up later requests.
+  // Each transport is a function (yahooUrl) => { url, wrapped } where `wrapped` means the
+  // response body is JSON like {contents:"<stringified json>"} (allorigins /get style).
+  const TRANSPORTS = [
+    { name: 'direct',     build: (u) => ({ url: u, wrapped: false }) },
+    { name: 'allorigins', build: (u) => ({ url: 'https://api.allorigins.win/get?url=' + encodeURIComponent(u), wrapped: true }) },
+    { name: 'codetabs',   build: (u) => ({ url: 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u), wrapped: false }) },
+    { name: 'corsproxy',  build: (u) => ({ url: 'https://corsproxy.io/?url=' + encodeURIComponent(u), wrapped: false }) },
+    { name: 'thingproxy', build: (u) => ({ url: 'https://thingproxy.freeboard.io/fetch/' + u, wrapped: false }) },
+  ];
+  let preferredTransport = 0;
+
+  /** Fetch a Yahoo URL through the transport chain; returns parsed chart JSON or throws. */
+  async function fetchViaTransports(yahooUrl) {
+    // Try preferred transport first, then the rest in order.
+    const order = [preferredTransport, ...TRANSPORTS.map((_, i) => i).filter(i => i !== preferredTransport)];
+    let lastErr;
+    for (const idx of order) {
+      const t = TRANSPORTS[idx];
+      try {
+        const { url, wrapped } = t.build(yahooUrl);
+        const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        if (res.status === 429) { lastErr = new Error('rate-limited'); continue; }
+        if (!res.ok) { lastErr = new Error('HTTP ' + res.status); continue; }
+        let json;
+        if (wrapped) {
+          const outer = await res.json();
+          if (!outer || typeof outer.contents !== 'string') { lastErr = new Error('bad wrap'); continue; }
+          json = JSON.parse(outer.contents);
+        } else {
+          json = await res.json();
+        }
+        if (!json?.chart?.result?.[0]) { lastErr = new Error('no chart data'); continue; }
+        preferredTransport = idx; // remember what worked
+        return json;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('all transports failed');
+  }
 
   // ---- Cache helpers ----
   function readCache(key, ttl, allowStale = false) {
@@ -54,7 +98,7 @@ const API = (() => {
    * @param {string} interval "1d"|"1wk"|"1mo"
    */
   async function fetchChart(symbol, range = '3mo', interval = '1d') {
-    const url = `${YH}/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false`;
+    const yahooUrl = `${YH}/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false`;
     const cacheKey = `chart_${symbol}_${range}_${interval}`;
     // TTL: intraday ranges shorter; daily ranges longer
     const ttl = (range === '1d' || range === '5d') ? 120_000 : 600_000;
@@ -68,13 +112,7 @@ const API = (() => {
 
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-          if (res.status === 429) {
-            nextAllowedAt = Date.now() + 10000;
-            throw new Error('rate-limited');
-          }
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          const json = await res.json();
+          const json = await fetchViaTransports(yahooUrl);
           const result = json.chart?.result?.[0];
           if (!result) throw new Error('No chart data');
 
@@ -173,19 +211,19 @@ const API = (() => {
           const data = await fetchChart(sym, '5d', '1d');
           const meta = data.meta;
           const prices = data.prices;
-          let price = meta.price;
-          let prevClose = meta.previousClose;
-          // If meta price is missing, derive from chart data
-          if ((price == null || price === 0) && prices.length) {
-            price = prices[prices.length - 1][1];
-          }
-          // If no previous close from meta, use second-to-last data point
-          if ((prevClose == null || prevClose === 0) && prices.length >= 2) {
-            prevClose = prices[prices.length - 2][1];
-          }
-          const changePct = (prevClose && price != null)
+          // Prefer the chart's own last two closes — they are internally consistent.
+          // Yahoo's meta.regularMarketPrice / chartPreviousClose can be stale for PSX,
+          // producing absurd daily % changes, so we only use them as a fallback.
+          let price = prices.length ? prices[prices.length - 1][1] : meta.price;
+          let prevClose = prices.length >= 2 ? prices[prices.length - 2][1] : meta.previousClose;
+          if (price == null || price === 0) price = meta.price;
+          if (prevClose == null || prevClose === 0) prevClose = meta.previousClose;
+          let changePct = (prevClose && price != null)
             ? ((price - prevClose) / Math.abs(prevClose)) * 100
             : null;
+          // Sanity guard: a single PSX session rarely moves > 40%.
+          // If we still see an implausible value, prevClose is bad data → treat change as null.
+          if (changePct != null && Math.abs(changePct) > 40) changePct = null;
           const volume = data.total_volumes.length
             ? data.total_volumes[data.total_volumes.length - 1][1]
             : null;
