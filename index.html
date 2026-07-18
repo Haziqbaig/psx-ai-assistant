@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StockSage AI — PSX Intelligence Terminal</title>
+<meta name="description" content="StockSage AI — professional Pakistan Stock Exchange (PSX) dashboard with technical indicators and AI-style recommendations for KSE-100 stocks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: {
+    fontFamily: { sans: ['Inter','sans-serif'], display: ['"Space Grotesk"','sans-serif'], mono: ['"IBM Plex Mono"','monospace'] },
+    colors: { base: '#060d12', teal: '#2dd4bf', gold: '#f0b429' }
+  }}
+};
+</script>
+<style>
+  /* Financial terminal — dark navy/teal/gold palette */
+  body { background: #060d12; }
+  html.light body { background: #eef2f4; }
+  .bg-mesh { background-image: radial-gradient(ellipse 55% 40% at 15% 0%, rgba(45,212,191,.10), transparent), radial-gradient(ellipse 50% 40% at 85% 5%, rgba(240,180,41,.08), transparent); }
+  html.light .bg-mesh { background-image: radial-gradient(ellipse 55% 40% at 15% 0%, rgba(45,212,191,.12), transparent), radial-gradient(ellipse 50% 40% at 85% 5%, rgba(240,180,41,.10), transparent); }
+  .glass { background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.07); backdrop-filter: blur(14px); border-radius: 0.9rem; }
+  html.light .glass { background: rgba(255,255,255,0.78); border-color: rgba(0,0,0,0.07); }
+  .glass-hover { transition: transform .2s, border-color .2s, box-shadow .2s; }
+  .glass-hover:hover { transform: translateY(-2px); border-color: rgba(45,212,191,.32); box-shadow: 0 8px 30px rgba(45,212,191,.07); }
+  .skeleton { position: relative; overflow: hidden; background: rgba(255,255,255,.06); border-radius: .4rem; }
+  html.light .skeleton { background: rgba(0,0,0,.07); }
+  .skeleton::after { content:''; position:absolute; inset:0; transform:translateX(-100%); background:linear-gradient(90deg,transparent,rgba(255,255,255,.07),transparent); animation:shimmer 1.4s infinite; }
+  @keyframes shimmer { 100% { transform: translateX(100%); } }
+  .fade-in { animation: fadeIn .35s ease both; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(6px);} to { opacity:1; transform:none; } }
+  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #2dd4bf; display: inline-block; animation: livePulse 2s infinite; box-shadow: 0 0 8px rgba(45,212,191,.6); }
+  @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
+  .text-body { color: #cbd5e1; } html.light .text-body { color: #334155; }
+  .text-head { color: #f1f5f9; } html.light .text-head { color: #0f172a; }
+  .text-dim { color: #64748b; }
+  .tab-active { background: linear-gradient(135deg, rgba(45,212,191,.16), rgba(240,180,41,.14)); color: #2dd4bf !important; border-color: rgba(45,212,191,.32) !important; }
+  html.light .tab-active { color: #0d9488 !important; }
+  select, input { color-scheme: dark; }
+  html.light select, html.light input { color-scheme: light; }
+  /* Ticker tape */
+  .ticker-wrap { overflow: hidden; white-space: nowrap; }
+  .ticker { display: inline-block; animation: tickerScroll 60s linear infinite; }
+  .ticker:hover { animation-play-state: paused; }
+  @keyframes tickerScroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+  .font-display { font-family: "Space Grotesk", sans-serif; }
+  .font-mono-num { font-family: "IBM Plex Mono", monospace; }
+</style>
+</head>
+<body class="font-sans text-body min-h-screen bg-mesh">
+
+<!-- Ticker tape -->
+<div class="border-b border-white/5 bg-black/20 backdrop-blur-sm">
+  <div class="ticker-wrap py-1.5" id="tickerWrap">
+    <div class="ticker text-xs font-mono-num" id="tickerTape"><span class="text-dim px-4">Loading PSX ticker…</span></div>
+  </div>
+</div>
+
+<div id="app" class="max-w-7xl mx-auto px-4 pb-16">
+  <!-- Header -->
+  <header class="flex flex-wrap items-center gap-3 py-4">
+    <div class="flex items-center gap-2.5 mr-auto cursor-pointer" onclick="App.nav('dashboard')">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-teal-400 to-amber-500 flex items-center justify-center font-display font-bold text-base text-slate-900 shadow-lg shadow-teal-500/20">§</div>
+      <div>
+        <div class="font-display font-bold text-head text-lg leading-tight">StockSage <span class="text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-amber-400">AI</span></div>
+        <div class="text-[10px] text-dim tracking-widest uppercase">PSX Intelligence Terminal</div>
+      </div>
+    </div>
+    <div id="tradingClock" class="text-xs order-2 sm:order-none">
+      <span class="w-[7px] h-[7px] rounded-full bg-slate-500 inline-block"></span> <span class="text-dim">Loading…</span>
+    </div>
+    <nav class="flex gap-1.5 order-4 sm:order-none w-full sm:w-auto overflow-x-auto whitespace-nowrap pb-1 sm:pb-0">
+      <button data-nav="dashboard" class="nav-btn shrink-0 px-3.5 py-2 rounded-lg text-sm border border-transparent text-body hover:text-teal-300 transition">Dashboard</button>
+      <button data-nav="watchlist" class="nav-btn shrink-0 px-3.5 py-2 rounded-lg text-sm border border-transparent text-body hover:text-teal-300 transition">Watchlist</button>
+      <button data-nav="sectors" class="nav-btn shrink-0 px-3.5 py-2 rounded-lg text-sm border border-transparent text-body hover:text-teal-300 transition">Sectors</button>
+      <button data-nav="alerts" class="nav-btn shrink-0 px-3.5 py-2 rounded-lg text-sm border border-transparent text-body hover:text-teal-300 transition">Alerts</button>
+      <button data-nav="settings" class="nav-btn shrink-0 px-3.5 py-2 rounded-lg text-sm border border-transparent text-body hover:text-teal-300 transition">Settings</button>
+    </nav>
+    <div class="relative order-3 sm:order-none">
+      <input id="searchInput" type="text" placeholder="Search KSE-100…" autocomplete="off"
+        class="glass !rounded-lg px-4 py-2 text-sm w-44 sm:w-56 outline-none focus:border-teal-400/50 bg-transparent text-head placeholder:text-dim">
+      <div id="searchResults" class="absolute right-0 mt-2 w-72 glass !rounded-lg shadow-2xl z-50 hidden max-h-80 overflow-y-auto"></div>
+    </div>
+  </header>
+
+  <main id="view"></main>
+</div>
+
+<div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 glass px-4 py-2.5 text-sm text-head hidden z-[100]"></div>
+
+<script src="js/stocks.js"></script>
+<script src="js/sectors.js"></script>
+<script src="js/api.js"></script>
+<script src="js/indicators.js"></script>
+<script src="js/recommend.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/app.js"></script>
+<script>
+// Ticker tape — populate with a few KSE stocks after load
+(async function initTicker() {
+  try {
+    const syms = ['^KSE','OGDC.KA','ENGRO.KA','HUBC.KA','LUCK.KA','MEBL.KA','SYS.KA','FFC.KA','MARI.KA','PPL.KA','UBL.KA','NESTLE.KA'];
+    const snaps = await API.snapshots(syms);
+    const parts = syms.map(sym => {
+      const s = snaps[sym];
+      if (!s || s.price == null) return '';
+      const label = sym === '^KSE' ? 'KSE-100' : sym.replace('.KA','');
+      const chg = s.changePct;
+      const cls = chg == null ? 'text-dim' : chg >= 0 ? 'text-emerald-400' : 'text-rose-400';
+      const arrow = chg == null ? '' : chg >= 0 ? '▲' : '▼';
+      const price = sym === '^KSE' ? s.price.toLocaleString('en-US',{maximumFractionDigits:0}) : s.price.toFixed(2);
+      return `<span class="px-4"><span class="text-head font-medium">${label}</span> <span class="text-body">${price}</span> <span class="${cls}">${arrow} ${chg!=null?chg.toFixed(2)+'%':''}</span></span>`;
+    }).filter(Boolean).join('<span class="text-dim">•</span>');
+    const tape = document.getElementById('tickerTape');
+    if (tape && parts) tape.innerHTML = parts + '<span class="text-dim">•</span>' + parts; // duplicate for seamless loop
+  } catch {
+    const tape = document.getElementById('tickerTape');
+    if (tape) tape.innerHTML = '<span class="text-dim px-4">PSX ticker unavailable — data source may be rate-limiting.</span>';
+  }
+})();
+</script>
+</body>
+</html>
