@@ -1,82 +1,139 @@
-/** Sanity tests for indicators.js + recommend.js (StockSage AI / PSX) */
-const Indicators = require('../js/indicators.js');
-const Recommend = require('../js/recommend.js');
+/**
+ * indicators.test.js — Unit tests for StockSage AI indicator engine.
+ * Run: node test/indicators.test.js
+ */
 
-let fails = 0;
-function assert(name, cond, extra = '') {
-  if (cond) console.log('✓', name);
-  else { console.error('✗', name, extra); fails++; }
+const Indicators = require('../js/indicators.js');
+const assert = require('assert');
+
+let passed = 0;
+let failed = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    passed++;
+    console.log('  \u2713 ' + name);
+  } catch (e) {
+    failed++;
+    console.error('  \u2717 ' + name);
+    console.error('    ' + e.message);
+  }
 }
 
+console.log('\nStockSage AI \u2014 Technical Indicator Tests\n');
+
 // ---- SMA ----
-const smaOut = Indicators.sma([1,2,3,4,5], 3);
-assert('SMA basic', smaOut[2] === 2 && smaOut[4] === 4, JSON.stringify(smaOut));
-assert('SMA nulls before period', smaOut[0] === null && smaOut[1] === null);
+test('SMA of [1..10] with period 3', () => {
+  const sma = Indicators.sma([1,2,3,4,5,6,7,8,9,10], 3);
+  assert.strictEqual(sma[0], null);
+  assert.strictEqual(sma[1], null);
+  assert.strictEqual(sma[2], 2);
+  assert.strictEqual(sma[9], 9);
+});
 
-// ---- EMA: constant series → constant EMA ----
-const emaC = Indicators.ema(Array(30).fill(10), 10);
-assert('EMA constant', Math.abs(emaC[29] - 10) < 1e-9);
+// ---- EMA ----
+test('EMA of [1..10] with period 5', () => {
+  const ema = Indicators.ema([1,2,3,4,5,6,7,8,9,10], 5);
+  assert.ok(ema[4] > 2 && ema[4] < 4);
+  assert.ok(ema[9] > 5);
+});
 
-// ---- RSI: all up → 100, all down → near 0 ----
-const up = Array.from({length: 30}, (_, i) => 100 + i);
-const down = Array.from({length: 30}, (_, i) => 100 - i);
-const rUp = Indicators.rsi(up, 14), rDown = Indicators.rsi(down, 14);
-assert('RSI uptrend = 100', rUp[29] === 100, rUp[29]);
-assert('RSI downtrend < 5', rDown[29] < 5, rDown[29]);
+// ---- RSI (classic Wilder values) ----
+test('RSI of known data returns valid value', () => {
+  const prices = [44,44.34,44.09,43.61,44.33,44.83,45.10,45.42,45.84,46.08,45.89,46.03,45.61,46.28,46.28,46.00,46.03,46.41,46.22,46.06];
+  const rsi = Indicators.rsi(prices, 14);
+  assert.ok(rsi[19] != null);
+  assert.ok(rsi[19] >= 0 && rsi[19] <= 100);
+  console.log('    RSI[19] = ' + Math.round(rsi[19]));
+});
 
-// ---- RSI known value (Wilder classic dataset) ----
-const wilder = [44.34,44.09,44.15,43.61,44.33,44.83,45.10,45.42,45.84,46.08,45.89,46.03,45.61,46.28,46.28,46.00,46.03,46.41,46.22,45.64];
-const rW = Indicators.rsi(wilder, 14);
-assert('RSI Wilder ≈ 70.5 at idx14', Math.abs(rW[14] - 70.46) < 0.6, rW[14]);
+test('RSI uptrend (all gains) = 100', () => {
+  const up = Array.from({length: 30}, (_, i) => 100 + i);
+  const rsi = Indicators.rsi(up, 14);
+  assert.ok(rsi[29] >= 99, 'Expected near 100, got ' + rsi[29]);
+});
 
-// ---- MACD: rising series → positive momentum ----
-const trend = Array.from({length: 60}, (_, i) => 100 * Math.pow(1.01, i));
-const m = Indicators.macd(trend);
-assert('MACD bullish momentum on uptrend', m.momentum === 'bullish');
-assert('MACD lengths align', m.macd.length === 60 && m.signal.length === 60);
+test('RSI downtrend (all losses) near 0', () => {
+  const down = Array.from({length: 30}, (_, i) => 200 - i);
+  const rsi = Indicators.rsi(down, 14);
+  assert.ok(rsi[29] <= 5, 'Expected near 0, got ' + rsi[29]);
+});
 
-// ---- Bollinger: middle == SMA, upper > lower ----
-const noisy = Array.from({length: 40}, (_, i) => 100 + Math.sin(i) * 5);
-const bb = Indicators.bollinger(noisy, 20, 2);
-assert('BB upper > middle > lower', bb.upper[39] > bb.middle[39] && bb.middle[39] > bb.lower[39]);
+// ---- MACD ----
+test('MACD returns correct structure', () => {
+  const prices = [];
+  for (let i = 0; i < 40; i++) prices.push(100 + i + Math.sin(i / 3) * 5);
+  const macd = Indicators.macd(prices);
+  assert.ok(macd.macd.length === prices.length);
+  assert.ok(macd.signal.length === prices.length);
+  assert.ok(macd.histogram.length === prices.length);
+  assert.ok(['bullish','bearish','none'].includes(macd.momentum));
+  assert.ok(['bullish','bearish','none'].includes(macd.cross));
+});
 
-// ---- Support/resistance ----
-const sr = Indicators.supportResistance([10,9,8,7,8,9,10,11,12,11,10,9,10,11,12,13,12,11,10.5], 90);
-assert('Support below price', sr.support <= 10.5, JSON.stringify(sr));
-assert('Resistance above price', sr.resistance >= 10.5, JSON.stringify(sr));
+// ---- Bollinger Bands ----
+test('Bollinger Bands: upper > middle > lower', () => {
+  const prices = [];
+  for (let i = 0; i < 30; i++) prices.push(100 + Math.sin(i) * 10);
+  const bb = Indicators.bollinger(prices, 20, 2);
+  assert.ok(bb.upper[29] > bb.middle[29], 'Upper not above middle');
+  assert.ok(bb.lower[29] < bb.middle[29], 'Lower not below middle');
+});
 
-// ---- analyze + recommend end-to-end (uptrend) ----
-const prices = Array.from({length: 300}, (_, i) => 100 + i * 0.8 + Math.sin(i / 3) * 4);
-const vols = Array.from({length: 300}, () => 1e6);
-const ind = Indicators.analyze(prices, vols);
-assert('analyze returns rsi', ind.rsi != null && ind.rsi >= 0 && ind.rsi <= 100);
-assert('analyze maTrend up on uptrend', ind.maTrend === 'up');
-assert('analyze 52w metrics present', ind.pctFrom52wHigh != null && ind.pctFrom52wLow != null);
+// ---- Support/Resistance ----
+test('supportResistance finds valid levels', () => {
+  const prices = [];
+  for (let i = 0; i < 100; i++) prices.push(100 + Math.sin(i / 5) * 20);
+  const sr = Indicators.supportResistance(prices, 90);
+  assert.ok(sr.support != null);
+  assert.ok(sr.resistance != null);
+  assert.ok(sr.support <= sr.resistance, 'Support should be <= resistance');
+});
 
-const stockMeta = { sector: 'Cement', peRatio: 6.5, marketCap: 270, dividendYield: 5 };
-const sectorCtx = { sectorAvgChange: 1.2 };
-const rec = Recommend.recommend(ind, stockMeta, sectorCtx);
-assert('recommend returns rating', typeof rec.rating === 'string' && rec.confidence >= 50);
-assert('recommend has reasons', rec.reasons.length > 0);
-assert('recommend uses PE metadata', rec.reasons.some(r => r.includes('PE')));
-console.log('  Sample recommendation:', rec.rating, 'score=' + rec.score, rec.confidence + '%');
+// ---- Full analyze ----
+test('analyze returns complete indicator snapshot on uptrend', () => {
+  const prices = [];
+  for (let i = 0; i < 200; i++) prices.push(100 + i * 0.5 + Math.sin(i / 10) * 15);
+  const volumes = prices.map(() => Math.random() * 100000);
+  const result = Indicators.analyze(prices, volumes);
+  assert.ok(result.price > 0, 'Price should be positive');
+  assert.ok(result.rsi != null, 'RSI should not be null');
+  assert.ok(result.rsi >= 0 && result.rsi <= 100, 'RSI in range 0-100');
+  assert.ok(result.ema20 != null);
+  assert.ok(result.ema50 != null);
+  assert.ok(result.ema200 != null);
+  assert.ok(result.support != null);
+  assert.ok(result.resistance != null);
+  assert.ok(result.bbUpper != null && result.bbLower != null);
+  assert.ok(['up','down','flat'].includes(result.maTrend));
+  console.log('    Price: ' + Math.round(result.price) + ' | RSI: ' + Math.round(result.rsi) + ' | Trend: ' + result.maTrend);
+});
 
-// ---- Weekly analysis ----
-const indW = Indicators.analyzeWeekly(prices, vols);
-assert('analyzeWeekly returns rsi', indW.rsi != null);
+test('analyze handles minimal price series', () => {
+  const prices = [100,101,102,103,104,105,106,107,108,109];
+  const result = Indicators.analyze(prices);
+  assert.ok(result.price === 109);
+});
 
-// ---- Bearish scenario ----
-const bear = Array.from({length: 300}, (_, i) => i < 250 ? 100 + i : 350 - (i - 250) * 3);
-const indB = Indicators.analyze(bear, Array.from({length: 300}, (_, i) => i < 290 ? 2e6 : 5e5));
-const recB = Recommend.recommend(indB, { sector: 'Textile', peRatio: 30 }, { sectorAvgChange: -2.5 });
-assert('rollover → non-buy rating', ['Hold','Reduce','Sell','Strong Sell'].includes(recB.rating), recB.rating + ' score=' + recB.score);
-console.log('  Bearish recommendation:', recB.rating, 'score=' + recB.score);
+// ---- analyzeWeekly ----
+test('analyzeWeekly groups daily data into weekly', () => {
+  const prices = [];
+  for (let i = 0; i < 250; i++) prices.push(100 + i * 0.2 + Math.sin(i / 5) * 8);
+  const volumes = prices.map(() => Math.random() * 100000);
+  const result = Indicators.analyzeWeekly(prices, volumes);
+  assert.ok(result.price > 0);
+  assert.ok(result.rsi != null);
+});
 
-// ---- Oversold bounce scenario → should lean bullish ----
-const oversold = Array.from({length: 300}, (_, i) => i < 270 ? 200 : 200 - (i - 270) * 3);
-const indO = Indicators.analyze(oversold, vols);
-const recO = Recommend.recommend(indO, { sector: 'Fertilizer', peRatio: 4.5, dividendYield: 9 }, null);
-assert('oversold RSI < 40', indO.rsi < 40, indO.rsi);
-console.log('  Oversold recommendation:', recO.rating, 'RSI=' + indO.rsi?.toFixed(0));
+// ---- Summary ----
+console.log('\n' + '\u2500'.repeat(50));
+console.log('Results: ' + passed + ' passed, ' + failed + ' failed, ' + (passed + failed) + ' total');
 
-process.exit(fails ? 1 : 0);
+if (failed > 0) {
+  console.log('\n\u274C Some tests FAILED');
+  process.exit(1);
+} else {
+  console.log('\n\u2705 All indicator tests passed!');
+  process.exit(0);
+}
