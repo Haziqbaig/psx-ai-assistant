@@ -481,7 +481,7 @@ const App = (() => {
     tbody.innerHTML = ordered.map(c => `
       <tr class="watchlist-row" onclick="App.navigate('stock','${c.symbol}')" style="cursor:pointer">
         <td class="p-3 font-semibold text-teal-300">${(c.symbol||'').replace('.KA','')}</td>
-        <td class="p-3 text-xs truncate max-w-[120px]">${c.name || c.symbol}</td>
+        <td class="p-3 text-xs truncate max-w-[120px]">${c.name || STOCK_MAP[c.symbol]?.name || c.symbol}</td>
         <td class="p-3 text-right">${UI.money(c.price, cur)}</td>
         <td class="p-3 text-right">${UI.pct(c.changePct)}</td>
         <td class="p-3 text-right hidden sm:table-cell text-xs">${fmtVol(c.volume)}</td>
@@ -533,6 +533,40 @@ const App = (() => {
       navigate('watchlist');
     } else {
       UI.toast('Already in watchlist');
+    }
+  }
+
+  /** Silent add — persists + toasts once, but does NOT navigate. Idempotent. */
+  function addToWatchlistSilent(symbol) {
+    if (!state.watchlist.includes(symbol)) {
+      state.watchlist.push(symbol);
+      saveWatchlist();
+      UI.toast(`${symbol.replace('.KA','')} added to your watchlist (KSE-100)`);
+    }
+  }
+
+  /**
+   * Look up ANY PSX symbol (not just KSE-100). Normalizes ticker, fetches live chart,
+   * and navigates to stock detail on success. Shows toast on failure.
+   */
+  async function lookupSymbol(query) {
+    const raw = (query || '').trim().toUpperCase().replace(/\s+/g, '');
+    const symbol = raw.endsWith('.KA') ? raw : raw + '.KA';
+
+    UI.toast(`Checking ${symbol}…`);
+
+    try {
+      const data = await API.fetchChart(symbol, '5d', '1d');
+      const price = data?.meta?.price;
+      const hasPrices = data?.prices?.length > 0;
+
+      if ((price != null && price > 0) || hasPrices) {
+        navigate('stock', symbol);
+      } else {
+        UI.toast(`No live data found for ${symbol} on PSX`);
+      }
+    } catch (e) {
+      UI.toast(`No live data found for ${symbol} on PSX`);
     }
   }
 
@@ -830,7 +864,8 @@ const App = (() => {
     const tok = newSeq();
     const cur = state.currency;
     const isIndex = symbol === '^KSE';
-    const meta = STOCK_MAP[symbol] || null;
+    const isKse100 = STOCK_MAP[symbol] != null;
+    const meta = isKse100 ? STOCK_MAP[symbol] : null;
 
     main().innerHTML = `<div class="space-y-4">${UI.skeletonCard(4)}${UI.skeletonCard(8)}</div>`;
 
@@ -840,6 +875,9 @@ const App = (() => {
       const displayChart = await API.chartForDisplayWithInterval(symbol, range, interval);
       const analysisChart = await API.chartForAnalysis(symbol, IND_DAYS);
       if (!isCurrent(tok)) return;
+
+      // Auto-add KSE-100 stocks silently on detail view
+      if (isKse100) addToWatchlistSilent(symbol);
 
       const m = analysisChart.meta || {};
       const prices = analysisChart.prices.map(p => p[1]);
@@ -854,6 +892,10 @@ const App = (() => {
       if ((!prevClose || prevClose === 0) && prices.length >= 2) prevClose = prices[prices.length-2];
       const changePct = (price && prevClose) ? ((price - prevClose) / prevClose) * 100 : null;
       const inWatch = state.watchlist.includes(symbol);
+      const displayName = m.name || symbol;
+      const displaySector = meta?.sector || '—';
+      const displayCap = meta?.marketCap ? ('₨'+meta.marketCap+'B') : '—';
+      const displayPE = meta?.peRatio != null ? (meta.peRatio.toFixed(1)+'x') : '—';
 
       const macdCls = ind.macd.momentum === 'bullish' ? 'text-emerald-400' : 'text-rose-400';
       const allTimeframes = ['1d','5d','1mo','3mo','6mo','1y','5y'];
@@ -865,28 +907,31 @@ const App = (() => {
             <div class="flex items-center gap-3">
               <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-teal-500/30 to-emerald-500/30 flex items-center justify-center font-bold text-teal-300">${isIndex?'KSE':symbol.replace('.KA','').slice(0,4)}</div>
               <div>
-                <div class="text-xl font-bold">${m.name || symbol}</div>
+                <div class="text-xl font-bold">${displayName}</div>
                 ${isIndex ? '<div class="text-dim text-xs">KSE-100 Index · PSX</div>'
-                  : `<div class="text-dim text-xs">${symbol.replace('.KA','')} · ${meta?.sector || 'PSX'}</div>`}
+                  : `<div class="text-dim text-xs">${symbol.replace('.KA','')} · ${displaySector}</div>`}
               </div>
             </div>
             <div class="text-right">
               <div class="text-3xl font-bold">${isIndex ? (price?price.toLocaleString('en-US',{maximumFractionDigits:0}):'—') : UI.money(price, cur)}</div>
               <div class="text-sm">${UI.pct(changePct)}</div>
             </div>
-            ${isIndex ? '' : `
+            ${isIndex ? '' : (isKse100 ? `
               <button onclick="App.toggleWatchlistStock('${symbol}')" class="px-4 py-2 rounded-lg text-sm font-medium transition
                 ${inWatch ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30 hover:bg-rose-500/25'
                           : 'bg-teal-500/15 text-teal-300 border border-teal-500/30 hover:bg-teal-500/25'}">
                 ${inWatch ? '<i class="fas fa-times mr-1"></i> Remove from Watchlist' : '<i class="fas fa-plus mr-1"></i> Add to Watchlist'}
-              </button>`}
+              </button>` : `
+              ${inWatch ? `<button onclick="App.toggleWatchlistStock('${symbol}')" class="px-4 py-2 rounded-lg text-sm font-medium transition bg-rose-500/15 text-rose-300 border border-rose-500/30 hover:bg-rose-500/25"><i class="fas fa-times mr-1"></i> Remove from Watchlist</button>`
+                        : `<button onclick="App.trackCustomStock('${symbol}')" class="px-4 py-2 rounded-lg text-sm font-medium transition bg-teal-500/15 text-teal-300 border border-teal-500/30 hover:bg-teal-500/25">➕ Track this stock</button>`}
+            `)}
           </div>
           <!-- Company info -->
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-4 pt-4 border-t border-navy-700/50">
             <div><div class="text-dim text-[10px] uppercase">52-Wk High</div><div class="text-sm">${m.high52w ? UI.money(m.high52w, cur) : '—'}</div></div>
             <div><div class="text-dim text-[10px] uppercase">52-Wk Low</div><div class="text-sm">${m.low52w ? UI.money(m.low52w, cur) : '—'}</div></div>
-            ${isIndex ? '' : `<div><div class="text-dim text-[10px] uppercase">Market Cap</div><div class="text-sm">${meta?.marketCap ? '₨'+meta.marketCap+'B' : '—'}</div></div>
-            <div><div class="text-dim text-[10px] uppercase">P/E Ratio</div><div class="text-sm">${meta?.peRatio != null ? meta.peRatio.toFixed(1)+'x' : '—'}</div></div>`}
+            ${isIndex ? '' : `<div><div class="text-dim text-[10px] uppercase">Market Cap</div><div class="text-sm">${displayCap}</div></div>
+            <div><div class="text-dim text-[10px] uppercase">P/E Ratio</div><div class="text-sm">${displayPE}</div></div>`}
             ${isIndex ? `<div><div class="text-dim text-[10px] uppercase">Exchange</div><div class="text-sm">PSX</div></div>
             <div><div class="text-dim text-[10px] uppercase">Currency</div><div class="text-sm">PKR</div></div>` : ''}
           </div>
@@ -967,6 +1012,16 @@ const App = (() => {
     navigate('stock', symbol);
   }
 
+  /** Manual "Track this stock" for non-KSE-100 symbols — adds + persists + re-renders. */
+  function trackCustomStock(symbol) {
+    if (!state.watchlist.includes(symbol)) {
+      state.watchlist.push(symbol);
+      saveWatchlist();
+      UI.toast(`${symbol.replace('.KA','')} added to your watchlist`);
+    }
+    navigate('stock', symbol);
+  }
+
   // ════════════════════════════════════════════
   // VIEW: Search
   // ════════════════════════════════════════════
@@ -1001,20 +1056,41 @@ const App = (() => {
         const matches = KSE100_STOCKS.filter(s =>
           s.name.toLowerCase().includes(q) || s.symbol.toLowerCase().includes(q) || s.sector.toLowerCase().includes(q)
         ).slice(0, 15);
-        if (!matches.length) {
-          results.innerHTML = `<div class="glass p-6 text-center text-dim">No stocks found matching "${input.value}"</div>`;
-          return;
+
+        // Build results HTML
+        let html = '';
+
+        if (matches.length) {
+          html += matches.map(s => `
+            <div class="glass glass-hover p-4 flex items-center gap-3" onclick="App.navigate('stock','${s.symbol}')">
+              <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-teal-500/20 to-emerald-500/20 flex items-center justify-center font-bold text-teal-300 text-xs">${s.symbol.replace('.KA','').slice(0,4)}</div>
+              <div class="flex-1 min-w-0">
+                <div class="font-semibold text-sm">${s.name}</div>
+                <div class="text-dim text-xs">${s.symbol.replace('.KA','')} · ${s.sector}</div>
+              </div>
+              <div class="text-xs text-dim">${s.sector}</div>
+              <i class="fas fa-chevron-right text-dim text-sm ml-2"></i>
+            </div>`).join('');
         }
-        results.innerHTML = matches.map(s => `
-          <div class="glass glass-hover p-4 flex items-center gap-3" onclick="App.navigate('stock','${s.symbol}')">
-            <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-teal-500/20 to-emerald-500/20 flex items-center justify-center font-bold text-teal-300 text-xs">${s.symbol.replace('.KA','').slice(0,4)}</div>
-            <div class="flex-1 min-w-0">
-              <div class="font-semibold text-sm">${s.name}</div>
-              <div class="text-dim text-xs">${s.symbol.replace('.KA','')} · ${s.sector}</div>
-            </div>
-            <div class="text-xs text-dim">${s.sector}</div>
-            <i class="fas fa-chevron-right text-dim text-sm ml-2"></i>
-          </div>`).join('');
+
+        // If query looks like a ticker and wasn't matched in KSE-100, show a lookup card
+        const cleanQ = q.toUpperCase().replace(/[^A-Z0-9.]/g, '');
+        if (cleanQ.length >= 2 && !KSE100_STOCKS.some(s => s.symbol.toUpperCase().includes(cleanQ))) {
+          const rawQ = input.value.trim();
+          html += `
+            <div class="glass glass-hover p-4 flex items-center gap-3 cursor-pointer border border-dashed border-teal-500/30" onclick="App.lookupSymbol('${rawQ.replace(/'/g, "\\'")}')">
+              <div class="w-10 h-10 rounded-lg bg-teal-500/10 flex items-center justify-center">
+                <i class="fas fa-satellite text-teal-300"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="font-semibold text-sm text-teal-300">🔍 Search PSX for '${rawQ.replace(/'/g, "\\'")}' — fetch live data</div>
+                <div class="text-dim text-xs">Not in KSE-100? Look up any symbol on the exchange</div>
+              </div>
+              <i class="fas fa-arrow-right text-teal-300 text-sm ml-2"></i>
+            </div>`;
+        }
+
+        results.innerHTML = html || `<div class="glass p-6 text-center text-dim">No stocks found matching "${input.value}"</div>`;
         input.focus();
       }, 200);
     });
@@ -1141,8 +1217,11 @@ const App = (() => {
     navigate,
     toggleTheme,
     addToWatchlist,
+    addToWatchlistSilent,
     removeFromWatchlist,
     toggleWatchlistStock,
+    trackCustomStock,
+    lookupSymbol,
     toggleSectorStocks,
     setIndexRange,
     setStockRange
