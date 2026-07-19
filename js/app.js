@@ -170,7 +170,7 @@ const App = (() => {
   }
 
   // ════════════════════════════════════════════
-  // VIEW: Dashboard (progressive — shows data as it arrives)
+  // VIEW: Dashboard (progressive — updates as v8 batches resolve)
   // ════════════════════════════════════════════
   async function renderDashboard() {
     const tok = newSeq();
@@ -178,18 +178,39 @@ const App = (() => {
     main().innerHTML = dashboardSkeleton();
 
     try {
-      // Fetch ALL KSE-100 stocks (batched ~3 requests) + index in PARALLEL
       const allSyms = KSE100_STOCKS.map(s => s.symbol);
-      const [indexData, snaps] = await Promise.all([
-        API.kse100Index('3mo').catch(() => null),
-        API.allSnapshots(allSyms).catch(() => ({}))
-      ]);
 
+      // Kick off index fetch immediately
+      const indexPromise = API.kse100Index('3mo').catch(() => null);
+
+      // Progressive callback: fires after each concurrency worker (~8 symbols) resolves.
+      // Only updates the data sections (gainers/losers/active/stats/sentiment) on the
+      // already-rendered shell — avoids full re-render flicker.
+      let shellRendered = false;
+      let latestIndexData = null;
+
+      function onSnapshotBatch(partialSnaps) {
+        if (!isCurrent(tok)) return;
+        if (!shellRendered) return; // wait for shell
+        renderDashboardData(partialSnaps, latestIndexData, tok);
+      }
+
+      const snapsPromise = API.allSnapshots(allSyms, onSnapshotBatch);
+
+      // Wait for index data first to render the shell
+      const indexData = await indexPromise;
       if (!isCurrent(tok)) return;
+      latestIndexData = indexData;
 
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-      // Render shell with index card + data immediately
       renderDashboardShell(indexData, tok, elapsed);
+      shellRendered = true;
+
+      // Now wait for all snapshots — progressive updates happen via onSnapshotBatch
+      const snaps = await snapsPromise;
+      if (!isCurrent(tok)) return;
+
+      // Final render with complete data
       renderDashboardData(snaps, indexData, tok);
     } catch (e) {
       if (!isCurrent(tok)) return;
