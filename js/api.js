@@ -2,31 +2,78 @@
  * api.js — Data layer for StockSage AI (PSX — Pakistan Stock Exchange).
  * Uses Yahoo Finance query2 API (client-side, no key needed).
  * All responses cached in localStorage with per-endpoint TTL.
+ * 
+ * PERF: Uses batched v7/finance/quote for snapshots (~3 requests for 95 stocks vs 95).
  */
 const API = (() => {
   const YH = 'https://query2.finance.yahoo.com/v8/finance/chart';
   const YH1 = 'https://query1.finance.yahoo.com/v8/finance/chart';
+  const YH_QUOTE_HOSTS = [
+    'https://query1.finance.yahoo.com/v7/finance/quote',
+    'https://query2.finance.yahoo.com/v7/finance/quote',
+  ];
   const CACHE_PREFIX = 'ss_cache_';
   const DEFAULT_TTL = 120_000; // 2 min for intraday, longer for daily
+  const SNAPSHOT_TTL = 60_000;  // 60s for batched snapshots
+  const BATCH_CHUNK = 40;       // symbols per batch quote request
 
-  // Yahoo Finance does NOT send CORS headers, so browser fetch is blocked cross-origin.
-  // We try a chain of transports: direct (in case of an extension / future CORS), then
-  // several public CORS proxies. The first that returns valid chart JSON wins, and the
-  // winning transport index is remembered for the session to speed up later requests.
-  // Each transport is a function (yahooUrl) => { url, wrapped } where `wrapped` means the
-  // response body is JSON like {contents:"<stringified json>"} (allorigins /get style).
+  // ---- CORS proxies (tried in order) ----
+  const CORS_PROXIES = [
+    { name: 'corsproxy',  build: (u) => ({ url: 'https://corsproxy.io/?' + encodeURIComponent(u), wrapped: false }) },
+    { name: 'allorigins', build: (u) => ({ url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u), wrapped: false }) },
+    { name: 'codetabs',   build: (u) => ({ url: 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u), wrapped: false }) },
+  ];
+
+  // ---- Chart transports (direct + proxies, for fetchChart) ----
   const TRANSPORTS = [
     { name: 'direct',     build: (u) => ({ url: u, wrapped: false }) },
     { name: 'allorigins', build: (u) => ({ url: 'https://api.allorigins.win/get?url=' + encodeURIComponent(u), wrapped: true }) },
     { name: 'codetabs',   build: (u) => ({ url: 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u), wrapped: false }) },
-    { name: 'corsproxy',  build: (u) => ({ url: 'https://corsproxy.io/?url=' + encodeURIComponent(u), wrapped: false }) },
+    { name: 'corsproxy',  build: (u) => ({ url: 'https://corsproxy.io/?' + encodeURIComponent(u), wrapped: false }) },
     { name: 'thingproxy', build: (u) => ({ url: 'https://thingproxy.freeboard.io/fetch/' + u, wrapped: false }) },
   ];
   let preferredTransport = 0;
 
-  /** Fetch a Yahoo URL through the transport chain; returns parsed chart JSON or throws. */
+  /**
+   * Robust fetch with CORS proxy fallback.
+   * Tries direct fetch first, then each CORS proxy in order.
+   * @param {string} url - the original URL to fetch
+   * @param {object} [opts] - extra fetch options
+   * @returns {Promise<Response>}
+   */
+  async function robustFetch(url, opts = {}) {
+    const headers = { 'Accept': 'application/json', ...(opts.headers || {}) };
+
+    // Try direct first
+    try {
+      const res = await fetch(url, { ...opts, headers });
+      if (res.ok) return res;
+      if (res.status === 429) throw new Error('rate-limited');
+    } catch (e) {
+      if (e.message === 'rate-limited') throw e;
+      // Fall through to proxies
+    }
+
+    // Try proxies
+    let lastErr;
+    for (const proxy of CORS_PROXIES) {
+      try {
+        const { url: proxyUrl } = proxy.build(url);
+        const res = await fetch(proxyUrl, { ...opts, headers });
+        if (res.ok) return res;
+        if (res.status === 429) { lastErr = new Error('rate-limited'); continue; }
+        lastErr = new Error('HTTP ' + res.status);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('all proxies failed');
+  }
+
+  /**
+   * Fetch a Yahoo chart URL through the transport chain; returns parsed chart JSON.
+   */
   async function fetchViaTransports(yahooUrl) {
-    // Try preferred transport first, then the rest in order.
     const order = [preferredTransport, ...TRANSPORTS.map((_, i) => i).filter(i => i !== preferredTransport)];
     let lastErr;
     for (const idx of order) {
@@ -45,7 +92,7 @@ const API = (() => {
           json = await res.json();
         }
         if (!json?.chart?.result?.[0]) { lastErr = new Error('no chart data'); continue; }
-        preferredTransport = idx; // remember what worked
+        preferredTransport = idx;
         return json;
       } catch (e) { lastErr = e; }
     }
@@ -73,8 +120,8 @@ const API = (() => {
     keys.slice(0, Math.ceil(keys.length / 2)).forEach(k => localStorage.removeItem(k));
   }
 
-  // ---- Request queue to avoid rate limiting Yahoo ----
-  const MIN_SPACING = 600;  // ms between requests
+  // ---- Request queue (reduced spacing — now mostly for detail views) ----
+  const MIN_SPACING = 200;  // ms between requests (was 600; reduced now that batches handle bulk)
   let queueTail = Promise.resolve();
   let nextAllowedAt = 0;
 
@@ -90,17 +137,112 @@ const API = (() => {
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  // ════════════════════════════════════════════
+  // BATCH QUOTE — the fast path for snapshots
+  // ════════════════════════════════════════════
+
+  /**
+   * Fetch batch quotes for many symbols using Yahoo v7 quote endpoint.
+   * Returns the same shape as snapshots(): { [symbol]: { symbol, name, price, previousClose,
+   *   changePct, volume, high52w, low52w, currency } }
+   * Uses localStorage cache with 60s TTL.
+   */
+  async function quoteBatch(symbols) {
+    const cacheKey = 'quote_' + [...symbols].sort().join(',');
+    const fresh = readCache(cacheKey, SNAPSHOT_TTL);
+    if (fresh) return fresh;
+
+    const result = {};
+
+    // Split into chunks
+    const chunks = [];
+    for (let i = 0; i < symbols.length; i += BATCH_CHUNK) {
+      chunks.push(symbols.slice(i, i + BATCH_CHUNK));
+    }
+
+    // Fetch all chunks in parallel
+    const chunkPromises = chunks.map(async (chunk, idx) => {
+      const symbolsParam = chunk.join(',');
+      let lastErr;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        // Try each Yahoo host
+        for (const host of YH_QUOTE_HOSTS) {
+          try {
+            const url = `${host}?symbols=${encodeURIComponent(symbolsParam)}`;
+            const res = await robustFetch(url);
+            const json = await res.json();
+            const quoteResponse = json?.quoteResponse;
+            if (!quoteResponse || !quoteResponse.result) {
+              lastErr = new Error('no quote data');
+              continue;
+            }
+
+            for (const q of quoteResponse.result) {
+              const sym = q.symbol;
+              if (!result[sym]) {
+                const price = q.regularMarketPrice;
+                const prevClose = q.regularMarketPreviousClose;
+                let changePct = q.regularMarketChangePercent;
+                // If changePct is absurd (>40%), recalculate from price/prev
+                if (changePct != null && Math.abs(changePct) > 40) {
+                  changePct = (price && prevClose) ? ((price - prevClose) / Math.abs(prevClose)) * 100 : null;
+                }
+                if ((changePct == null || isNaN(changePct)) && prevClose && price != null) {
+                  changePct = ((price - prevClose) / Math.abs(prevClose)) * 100;
+                }
+                result[sym] = {
+                  symbol: sym,
+                  name: q.longName || q.shortName || sym,
+                  price: price ?? null,
+                  previousClose: prevClose ?? null,
+                  changePct: changePct ?? null,
+                  volume: q.regularMarketVolume ?? null,
+                  high52w: q.fiftyTwoWeekHigh ?? null,
+                  low52w: q.fiftyTwoWeekLow ?? null,
+                  currency: q.currency || 'PKR',
+                  timezone: q.timezone || 'PKT',
+                  marketCap: q.marketCap ?? null,
+                };
+              }
+            }
+            nextAllowedAt = Date.now() + MIN_SPACING;
+            return; // chunk succeeded
+          } catch (e) {
+            lastErr = e;
+            if (e.message === 'rate-limited') break; // don't retry other host, wait
+          }
+        }
+        if (lastErr && lastErr.message !== 'rate-limited' && attempt < 1) {
+          await sleep(1000);
+        }
+      }
+
+      // Chunk failed — fill with error entries
+      console.warn('quoteBatch chunk failed:', lastErr);
+      for (const sym of chunk) {
+        if (!result[sym]) {
+          result[sym] = { symbol: sym, name: sym, price: null, changePct: null, volume: null, error: lastErr?.message || 'unknown' };
+        }
+      }
+    });
+
+    await Promise.allSettled(chunkPromises);
+    writeCache(cacheKey, result);
+    return result;
+  }
+
+  // ════════════════════════════════════════════
+  // FETCH CHART (individual symbol, for detail views)
+  // ════════════════════════════════════════════
+
   /**
    * Fetch chart data from Yahoo Finance.
    * Returns normalized { prices, volumes, candles, meta } or throws.
-   * @param {string} symbol e.g. "ENGRO.KA"
-   * @param {string} range "1d"|"5d"|"1mo"|"3mo"|"6mo"|"1y"|"2y"|"5y"|"max"
-   * @param {string} interval "1d"|"1wk"|"1mo"
    */
   async function fetchChart(symbol, range = '3mo', interval = '1d') {
     const yahooUrl = `${YH}/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false`;
     const cacheKey = `chart_${symbol}_${range}_${interval}`;
-    // TTL: intraday ranges shorter; daily ranges longer
     const ttl = (range === '1d' || range === '5d') ? 120_000 : 600_000;
 
     const fresh = readCache(cacheKey, ttl);
@@ -146,7 +288,6 @@ const API = (() => {
             }
           }
 
-          // If no closes but we have open/high/low, use those
           if (!prices.length && ts.length && opens.length) {
             for (let i = 0; i < ts.length; i++) {
               if (opens[i] != null) {
@@ -195,67 +336,31 @@ const API = (() => {
     });
   }
 
+  // ════════════════════════════════════════════
+  // SNAPSHOTS — individual (legacy compat), now powered by quoteBatch
+  // ════════════════════════════════════════════
+
   /**
-   * Fetch a batch of stock snapshots (current price + daily change).
-   * Uses fetchChart with 2d range to get the latest close and previous close.
-   * @param {string[]} symbols array of e.g. ["ENGRO.KA", "HUBC.KA"]
-   * @returns {Object<string, {symbol, name, price, changePct, volume, high52w, low52w, currency}>}
+   * Fetch snapshots for a list of symbols. Uses batched quote endpoint (FAST).
+   * Returns same shape as before.
    */
   async function snapshots(symbols) {
-    const result = {};
-    const batchSize = 3; // Small batches to avoid overwhelming Yahoo
-    for (let i = 0; i < symbols.length; i += batchSize) {
-      const batch = symbols.slice(i, i + batchSize);
-      const promises = batch.map(async (sym) => {
-        try {
-          const data = await fetchChart(sym, '5d', '1d');
-          const meta = data.meta;
-          const prices = data.prices;
-          // Prefer the chart's own last two closes — they are internally consistent.
-          // Yahoo's meta.regularMarketPrice / chartPreviousClose can be stale for PSX,
-          // producing absurd daily % changes, so we only use them as a fallback.
-          let price = prices.length ? prices[prices.length - 1][1] : meta.price;
-          let prevClose = prices.length >= 2 ? prices[prices.length - 2][1] : meta.previousClose;
-          if (price == null || price === 0) price = meta.price;
-          if (prevClose == null || prevClose === 0) prevClose = meta.previousClose;
-          let changePct = (prevClose && price != null)
-            ? ((price - prevClose) / Math.abs(prevClose)) * 100
-            : null;
-          // Sanity guard: a single PSX session rarely moves > 40%.
-          // If we still see an implausible value, prevClose is bad data → treat change as null.
-          if (changePct != null && Math.abs(changePct) > 40) changePct = null;
-          const volume = data.total_volumes.length
-            ? data.total_volumes[data.total_volumes.length - 1][1]
-            : null;
-          result[sym] = {
-            symbol: sym,
-            name: meta.name || sym,
-            price: price,
-            previousClose: prevClose,
-            changePct: changePct,
-            volume: volume,
-            high52w: meta.high52w,
-            low52w: meta.low52w,
-            currency: meta.currency || 'PKR',
-            timezone: meta.timezone || 'PKT'
-          };
-        } catch (e) {
-          result[sym] = { symbol: sym, name: sym, price: null, changePct: null, volume: null, error: e.message };
-        }
-      });
-      await Promise.allSettled(promises);
-    }
-    return result;
+    return quoteBatch(symbols);
   }
 
   /**
-   * Get detailed chart data for technical analysis — both daily and weekly.
-   * Returns daily chart suitable for Indicators.analyze.
-   * @param {string} symbol
-   * @param {number} lookbackDays days of data needed (for EMA200, need 220+)
+   * Get all stock snapshots at once (batched internally via quoteBatch).
+   * @param {string[]|null} symbols - defaults to ALL KSE-100 stocks
+   */
+  async function allSnapshots(symbols = null) {
+    const syms = symbols || KSE100_STOCKS.map(s => s.symbol);
+    return quoteBatch(syms);
+  }
+
+  /**
+   * Get detailed chart data for technical analysis.
    */
   async function chartForAnalysis(symbol, lookbackDays = 250) {
-    // Map days to Yahoo range string
     const range = lookbackDays <= 5 ? '5d'
       : lookbackDays <= 30 ? '1mo'
       : lookbackDays <= 90 ? '3mo'
@@ -268,9 +373,7 @@ const API = (() => {
   }
 
   /**
-   * Get chart data for display (specific range).
-   * @param {string} symbol
-   * @param {string} chartRange "1mo"|"3mo"|"6mo"|"1y"|"2y"|"5y"
+   * Get chart data for display.
    */
   async function chartForDisplay(symbol, chartRange = '3mo') {
     return fetchChart(symbol, chartRange, '1d');
@@ -284,27 +387,28 @@ const API = (() => {
   }
 
   /**
-   * Get all stock snapshots at once for the dashboard (paginated internally).
-   * @param {number} maxConcurrent max parallel requests
+   * Fetch KSE-100 index with custom interval (for intraday charts).
    */
-  async function allSnapshots(symbols = null, maxConcurrent = 4) {
-    const syms = symbols || KSE100_STOCKS.map(s => s.symbol);
-    const result = {};
-    // Process in batches
-    for (let i = 0; i < syms.length; i += maxConcurrent) {
-      const batch = syms.slice(i, i + maxConcurrent);
-      const batchResult = await snapshots(batch);
-      Object.assign(result, batchResult);
-    }
-    return result;
+  async function kse100IndexWithInterval(range, interval) {
+    return fetchChart('^KSE', range, interval);
+  }
+
+  /**
+   * Get chart data for display with explicit interval.
+   */
+  async function chartForDisplayWithInterval(symbol, range, interval) {
+    return fetchChart(symbol, range, interval);
   }
 
   return {
     fetchChart,
     chartForAnalysis,
     chartForDisplay,
+    chartForDisplayWithInterval,
     snapshots,
     allSnapshots,
-    kse100Index
+    quoteBatch,
+    kse100Index,
+    kse100IndexWithInterval
   };
 })();

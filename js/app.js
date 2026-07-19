@@ -68,6 +68,21 @@ const App = (() => {
   }
 
   // ---- Routing ----
+
+  /** Map UI timeframe key → { range, interval } for Yahoo Finance */
+  function chartTimeframe(key) {
+    const map = {
+      '1d':  { range: '1d',  interval: '5m' },
+      '5d':  { range: '5d',  interval: '30m' },
+      '1mo': { range: '1mo', interval: '1d' },
+      '3mo': { range: '3mo', interval: '1d' },
+      '6mo': { range: '6mo', interval: '1d' },
+      '1y':  { range: '1y',  interval: '1d' },
+      '5y':  { range: '5y',  interval: '1wk' },
+    };
+    return map[key] || map['3mo'];
+  }
+
   function navigate(route, data) {
     if (!route) return;
     newSeq();
@@ -155,27 +170,26 @@ const App = (() => {
   }
 
   // ════════════════════════════════════════════
-  // VIEW: Dashboard
+  // VIEW: Dashboard (progressive — shows data as it arrives)
   // ════════════════════════════════════════════
   async function renderDashboard() {
     const tok = newSeq();
+    const t0 = performance.now();
     main().innerHTML = dashboardSkeleton();
 
     try {
-      // Fetch KSE-100 index + a representative batch of stock snapshots
-      const dashSymbols = [...new Set([...state.watchlist, ...KSE100_STOCKS.slice(0, 50).map(s => s.symbol)])];
-
-      let indexData = null;
-      try { indexData = await API.kse100Index('3mo'); } catch {}
+      // Fetch ALL KSE-100 stocks (batched ~3 requests) + index in PARALLEL
+      const allSyms = KSE100_STOCKS.map(s => s.symbol);
+      const [indexData, snaps] = await Promise.all([
+        API.kse100Index('3mo').catch(() => null),
+        API.allSnapshots(allSyms).catch(() => ({}))
+      ]);
 
       if (!isCurrent(tok)) return;
 
-      // Render shell with index card
-      renderDashboardShell(indexData, tok);
-
-      // Fetch snapshots and fill data
-      const snaps = await API.allSnapshots(dashSymbols, 4);
-      if (!isCurrent(tok)) return;
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      // Render shell with index card + data immediately
+      renderDashboardShell(indexData, tok, elapsed);
       renderDashboardData(snaps, indexData, tok);
     } catch (e) {
       if (!isCurrent(tok)) return;
@@ -185,12 +199,13 @@ const App = (() => {
 
   function dashboardSkeleton() {
     return `<div class="space-y-4 fade-in">
+      <div class="text-center text-xs text-dim">Fetching live PSX data…</div>
       <div class="stats-grid">${Array(4).fill(UI.skeletonCard(2)).join('')}</div>
       <div class="grid gap-4 lg:grid-cols-3">${Array(3).fill(UI.skeletonCard(6)).join('')}</div>
     </div>`;
   }
 
-  function renderDashboardShell(indexData, tok) {
+  function renderDashboardShell(indexData, tok, elapsed) {
     if (!isCurrent(tok)) return;
     const m = indexData?.meta || {};
     let idxPrice = m.price;
@@ -255,6 +270,8 @@ const App = (() => {
         <div class="font-semibold text-sm mb-3 flex items-center gap-2"><i class="fas fa-fire text-amber-400"></i> Most Active</div>
         <div id="activeList" class="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">${Array(5).fill(UI.skeleton('h-10','w-full')).join('')}</div>
       </div>
+
+      <div class="text-center text-[10px] text-dim">Loaded in ${elapsed || '—'}s · ${new Date().toLocaleTimeString()}</div>
     </div>`;
   }
 
@@ -513,7 +530,7 @@ const App = (() => {
     main().innerHTML = `<div class="space-y-3">${Array(6).fill(UI.skeletonCard(3)).join('')}</div>`;
     try {
       const allSyms = KSE100_STOCKS.map(s => s.symbol);
-      const snaps = await API.allSnapshots(allSyms, 4);
+      const snaps = await API.allSnapshots(allSyms);
       if (!isCurrent(tok)) return;
 
       const priceMap = {};
@@ -581,7 +598,7 @@ const App = (() => {
     main().innerHTML = `<div class="space-y-4">${Array(4).fill(UI.skeletonCard(4)).join('')}</div>`;
     try {
       const allSyms = KSE100_STOCKS.map(s => s.symbol);
-      const snaps = await API.allSnapshots(allSyms, 4);
+      const snaps = await API.allSnapshots(allSyms);
       if (!isCurrent(tok)) return;
 
       const priceMap = {};
@@ -677,7 +694,9 @@ const App = (() => {
     const tok = newSeq();
     main().innerHTML = `<div class="space-y-4">${UI.skeletonCard(5)}${UI.skeletonCard(6)}</div>`;
     try {
-      const data = await API.kse100Index(state.chartRange || '3mo');
+      const rangeKey = state.chartRange || '3mo';
+      const { range, interval } = chartTimeframe(rangeKey);
+      const data = await API.kse100IndexWithInterval(range, interval);
       if (!isCurrent(tok)) return;
 
       const m = data.meta || {};
@@ -686,14 +705,15 @@ const App = (() => {
       if ((!prevClose || prevClose === 0) && data.prices?.length >= 2) prevClose = data.prices[data.prices.length-2][1];
       const changePct = (price && prevClose) ? ((price - prevClose) / prevClose) * 100 : null;
 
-      // Compute indicators on index prices
-      const iprices = data.prices.map(p => p[1]);
-      const ivols = data.total_volumes.map(v => v[1]);
+      // Compute indicators on index prices (use analysis chart for long-term; skip for intraday)
+      const analysisChart = await API.chartForAnalysis('^KSE', IND_DAYS);
+      const iprices = analysisChart.prices.map(p => p[1]);
+      const ivols = analysisChart.total_volumes.map(v => v[1]);
       const ind = Indicators.analyze(iprices, ivols);
       const rec = Recommend.recommend(ind, null, null);
 
       const macdCls = ind.macd.momentum === 'bullish' ? 'text-emerald-400' : 'text-rose-400';
-      const rangeOptions = ['1mo','3mo','6mo','1y'];
+      const allTimeframes = ['1d','5d','1mo','3mo','6mo','1y','5y'];
 
       main().innerHTML = `<div class="fade-in space-y-5">
         <!-- Header -->
@@ -720,8 +740,8 @@ const App = (() => {
         <div class="glass p-5">
           <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
             <div class="font-semibold">Price Chart</div>
-            <div class="flex gap-1.5">
-              ${rangeOptions.map(r => `<button onclick="App.setIndexRange('${r}')" class="px-3 py-1 rounded-lg text-xs border ${state.chartRange===r?'bg-teal-500/20 text-teal-300 border-teal-500/30':'border-transparent text-dim hover:text-slate-300'} transition">${r.toUpperCase()}</button>`).join('')}
+            <div class="flex gap-1.5 flex-wrap">
+              ${allTimeframes.map(r => `<button onclick="App.setIndexRange('${r}')" class="px-3 py-1 rounded-lg text-xs border ${state.chartRange===r?'bg-teal-500/20 text-teal-300 border-teal-500/30':'border-transparent text-dim hover:text-slate-300'} transition">${r.toUpperCase()}</button>`).join('')}
             </div>
           </div>
           <div style="height:350px"><canvas id="indexChart"></canvas></div>
@@ -769,7 +789,7 @@ const App = (() => {
       </div>`;
 
       // Draw chart after DOM update
-      setTimeout(() => drawChart('indexChart', data, changePct >= 0), 50);
+      setTimeout(() => drawChart('indexChart', data, changePct >= 0, rangeKey), 50);
     } catch (e) {
       if (!isCurrent(tok)) return;
       main().innerHTML = UI.errorCard('Failed to load KSE-100 index data.', "App.navigate('index')");
@@ -794,17 +814,17 @@ const App = (() => {
     main().innerHTML = `<div class="space-y-4">${UI.skeletonCard(4)}${UI.skeletonCard(8)}</div>`;
 
     try {
-      const [displayChart, analysisChart] = await Promise.all([
-        API.chartForDisplay(symbol, state.chartRange || '3mo'),
-        API.chartForAnalysis(symbol, IND_DAYS)
-      ]);
+      const rangeKey = state.chartRange || '3mo';
+      const { range, interval } = chartTimeframe(rangeKey);
+      const displayChart = await API.chartForDisplayWithInterval(symbol, range, interval);
+      const analysisChart = await API.chartForAnalysis(symbol, IND_DAYS);
       if (!isCurrent(tok)) return;
 
       const m = analysisChart.meta || {};
       const prices = analysisChart.prices.map(p => p[1]);
       const vols = analysisChart.total_volumes.map(v => v[1]);
       const ind = Indicators.analyze(prices, vols);
-      const sectorCtx = null; // Simplified
+      const sectorCtx = null;
       const rec = Recommend.recommend(ind, meta, sectorCtx);
 
       let price = m.price;
@@ -815,7 +835,7 @@ const App = (() => {
       const inWatch = state.watchlist.includes(symbol);
 
       const macdCls = ind.macd.momentum === 'bullish' ? 'text-emerald-400' : 'text-rose-400';
-      const rangeOptions = ['1mo','3mo','6mo','1y'];
+      const allTimeframes = ['1d','5d','1mo','3mo','6mo','1y','5y'];
 
       main().innerHTML = `<div class="fade-in space-y-5">
         <!-- Header -->
@@ -855,8 +875,8 @@ const App = (() => {
         <div class="glass p-5">
           <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
             <div class="font-semibold">Price Chart</div>
-            <div class="flex gap-1.5">
-              ${rangeOptions.map(r => `<button onclick="App.setStockRange('${symbol}','${r}')" class="px-3 py-1 rounded-lg text-xs border ${state.chartRange===r?'bg-teal-500/20 text-teal-300 border-teal-500/30':'border-transparent text-dim hover:text-slate-300'} transition">${r.toUpperCase()}</button>`).join('')}
+            <div class="flex gap-1.5 flex-wrap">
+              ${allTimeframes.map(r => `<button onclick="App.setStockRange('${symbol}','${r}')" class="px-3 py-1 rounded-lg text-xs border ${state.chartRange===r?'bg-teal-500/20 text-teal-300 border-teal-500/30':'border-transparent text-dim hover:text-slate-300'} transition">${r.toUpperCase()}</button>`).join('')}
             </div>
           </div>
           <div style="height:350px"><canvas id="stockDetailChart"></canvas></div>
@@ -902,7 +922,7 @@ const App = (() => {
         </div>
       </div>`;
 
-      setTimeout(() => drawChart('stockDetailChart', displayChart, changePct >= 0), 50);
+      setTimeout(() => drawChart('stockDetailChart', displayChart, changePct >= 0, rangeKey), 50);
     } catch (e) {
       if (!isCurrent(tok)) return;
       main().innerHTML = UI.errorCard(`Failed to load data for ${symbol}.`, `App.navigate('stock','${symbol}')`);
@@ -985,16 +1005,24 @@ const App = (() => {
   // ════════════════════════════════════════════
   // Chart.js Rendering
   // ════════════════════════════════════════════
-  function drawChart(canvasId, chartData, isUp) {
+  function drawChart(canvasId, chartData, isUp, rangeKey) {
     const canvas = document.getElementById(canvasId);
     if (!canvas) return;
-    // Destroy existing chart on this canvas
     const existing = Chart.getChart(canvas);
     if (existing) existing.destroy();
 
     const prices = chartData.prices;
     if (!prices || !prices.length) return;
-    const labels = prices.map(p => new Date(p[0]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+
+    // Format labels based on timeframe: intraday → time, daily+ → date
+    const isIntraday = rangeKey === '1d' || rangeKey === '5d';
+    const labels = prices.map(p => {
+      const d = new Date(p[0]);
+      if (isIntraday) {
+        return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+      }
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    });
     const data = prices.map(p => p[1]);
     const color = isUp ? '#2dd4bf' : '#fb7185';
     const ctx = canvas.getContext('2d');
