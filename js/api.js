@@ -94,6 +94,107 @@ const API = (() => {
     }
   }
 
+  // ════════════════════════════════════════
+  // PSX OFFICIAL DATA PORTAL (dps.psx.com.pk) — primary source.
+  // The exchange itself: no rate limits like Yahoo, always accurate.
+  // No CORS headers though, so browser access goes through public proxies
+  // (corsproxy.io allows browser-origin requests on the free tier).
+  // ════════════════════════════════════════
+  const PSX_DPS = 'https://dps.psx.com.pk';
+  const CORS_PROXIES = [
+    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + u,
+  ];
+  const deadProxies = new Set();
+
+  /** Fetch text through the first working CORS proxy (8s timeout each). */
+  async function proxyFetchText(url) {
+    let lastErr;
+    for (let i = 0; i < CORS_PROXIES.length; i++) {
+      if (deadProxies.has(i)) continue;
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const res = await fetch(CORS_PROXIES[i](url), { cache: 'no-store', signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const text = await res.text();
+        if (!text || text.startsWith('error code')) throw new Error('proxy error body');
+        return text;
+      } catch (e) {
+        lastErr = e;
+        deadProxies.add(i); // don't waste 8s on this proxy again this session
+      }
+    }
+    throw lastErr || new Error('all proxies failed');
+  }
+
+  /**
+   * ONE request for the whole market: parse the PSX market-watch table.
+   * Returns { 'OGDC.KA': snapshot, ... } keyed with the app's .KA convention.
+   */
+  async function psxMarketWatch() {
+    const cacheKey = 'psx_mw';
+    const fresh = readCache(cacheKey, snapshotTtl());
+    if (fresh) return fresh;
+    const html = await proxyFetchText(PSX_DPS + '/market-watch');
+    const out = {};
+    const rowRe = /<tr><td data-search="([A-Z0-9]+)"[\s\S]*?data-title="([^"]*)"[\s\S]*?<\/tr>/g;
+    const ordRe = /data-order="(-?[\d.]+)"/g;
+    let m;
+    while ((m = rowRe.exec(html)) !== null) {
+      const sym = m[1], row = m[0];
+      const name = m[2].replace(/&amp;/g, '&').replace(/&#0?39;|&apos;/g, "'").replace(/&quot;/g, '"');
+      const nums = [];
+      let o; ordRe.lastIndex = 0;
+      while ((o = ordRe.exec(row)) !== null) nums.push(parseFloat(o[1]));
+      // column order: ldcp, open, high, low, close(current), change, %change, volume
+      if (nums.length < 8) continue;
+      const [ldcp, open, high, low, close, change, pct, volume] = nums;
+      if (!close) continue;
+      out[sym + '.KA'] = {
+        symbol: sym + '.KA',
+        name: name || sym,
+        price: close,
+        previousClose: ldcp || null,
+        changePct: isFinite(pct) ? pct : (ldcp ? ((close - ldcp) / ldcp) * 100 : null),
+        volume: volume || null,
+        high52w: null, low52w: null,
+        dayHigh: high || null, dayLow: low || null, open: open || null,
+        currency: 'PKR', timezone: 'PKT', marketCap: null,
+      };
+    }
+    if (!Object.keys(out).length) throw new Error('market-watch parse failed');
+    writeCache(cacheKey, out);
+    return out;
+  }
+
+  /** PSX intraday index timeseries → chart shape (fallback when Yahoo dies). */
+  async function psxIndexChart(indexName = 'KSE100') {
+    const cacheKey = 'psx_idx_' + indexName;
+    const fresh = readCache(cacheKey, INTRADAY_TTL);
+    if (fresh) return fresh;
+    const text = await proxyFetchText(`${PSX_DPS}/timeseries/int/${indexName}`);
+    const json = JSON.parse(text);
+    const rows = (json?.data || []).slice().reverse(); // newest-first → oldest-first
+    if (!rows.length) throw new Error('no index data');
+    const prices = rows.map(r => [r[0] * 1000, r[1]]);
+    const last = prices[prices.length - 1][1];
+    const first = prices[0][1];
+    const data = {
+      prices,
+      total_volumes: rows.map(r => [r[0] * 1000, r[2] || 0]),
+      candles: null,
+      meta: {
+        price: last, currency: 'PKR', name: 'KSE-100 Index',
+        previousClose: first, exchangeName: 'PSX', timezone: 'PKT', gmtoffset: 18000,
+      },
+    };
+    writeCache(cacheKey, data);
+    return data;
+  }
+
   // ---- Build v8 chart URL ----
   function chartUrl(symbol, range, interval) {
     const host = YH_PRIMARY; // query1 is most reliable
@@ -371,6 +472,22 @@ const API = (() => {
     const stale = readCache(cacheKey, Infinity, true);
     if (stale && onBatch) onBatch(stale);
 
+    // Fastest path: PSX official market-watch — the WHOLE market in 1 request
+    try {
+      const mw = await psxMarketWatch();
+      const subset = {};
+      let hits = 0;
+      for (const s of symbols) { if (mw[s]) { subset[s] = mw[s]; hits++; } }
+      // Good enough when we cover most requested symbols (some tickers may be
+      // renamed/delisted on the exchange — don't let a few gaps kill the fast path)
+      if (hits >= symbols.length * 0.6) {
+        for (const s of symbols) if (!subset[s]) subset[s] = stale?.[s] || { symbol: s, name: s, price: null, changePct: null, volume: null };
+        writeCache(cacheKey, subset);
+        if (onBatch) onBatch(subset);
+        return subset;
+      }
+    } catch (_) { /* PSX portal or proxies unavailable — fall through to Yahoo */ }
+
     // Fast path: batched spark quotes (a handful of requests for all symbols)
     let spark = null;
     try {
@@ -501,7 +618,13 @@ const API = (() => {
   }
 
   async function kse100Index(range = '3mo') {
-    return fetchChart('^KSE', range, '1d');
+    try {
+      return await fetchChart('^KSE', range, '1d');
+    } catch (e) {
+      // Yahoo rate-limited → PSX official intraday index (1d shape, but keeps
+      // the dashboard alive with a real index number)
+      return psxIndexChart('KSE100');
+    }
   }
 
   async function kse100IndexWithInterval(range, interval) {
@@ -521,6 +644,8 @@ const API = (() => {
     allSnapshots,
     kse100Index,
     kse100IndexWithInterval,
-    isMarketOpen
+    isMarketOpen,
+    psxMarketWatch,
+    psxIndexChart
   };
 })();
