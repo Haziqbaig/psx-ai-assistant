@@ -13,7 +13,7 @@ const KSE100_STOCKS = [
 
   // ---- Oil & Gas Marketing ----
   { symbol: "PSO.KA", name: "Pakistan State Oil", sector: "Oil & Gas Marketing", marketCap: 65, peRatio: 4.8 },
-  { symbol: "SHEL.KA", name: "Shell Pakistan", sector: "Oil & Gas Marketing", marketCap: 35, peRatio: 6.1 },
+  { symbol: "WAFI.KA", name: "Wafi Energy Pakistan (ex-Shell)", sector: "Oil & Gas Marketing", marketCap: 35, peRatio: 6.1 },
   { symbol: "APL.KA", name: "Attock Petroleum Ltd.", sector: "Oil & Gas Marketing", marketCap: 50, peRatio: 4.2 },
   { symbol: "HASCOL.KA", name: "Hascol Petroleum", sector: "Oil & Gas Marketing", marketCap: 8, peRatio: null },
 
@@ -44,15 +44,14 @@ const KSE100_STOCKS = [
   { symbol: "THCCL.KA", name: "Thatta Cement Co.", sector: "Cement", marketCap: 8, peRatio: 12.5 },
 
   // ---- Fertilizer ----
-  { symbol: "ENGRO.KA", name: "Engro Corporation Ltd.", sector: "Fertilizer", marketCap: 190, peRatio: 5.2 },
+  { symbol: "ENGROH.KA", name: "Engro Holdings Ltd.", sector: "Fertilizer", marketCap: 190, peRatio: 5.2 },
   { symbol: "FFC.KA", name: "Fauji Fertilizer Co.", sector: "Fertilizer", marketCap: 240, peRatio: 4.8 },
-  { symbol: "FFBL.KA", name: "Fauji Fertilizer Bin Qasim", sector: "Fertilizer", marketCap: 60, peRatio: 6.5 },
   { symbol: "FATIMA.KA", name: "Fatima Fertilizer Co.", sector: "Fertilizer", marketCap: 85, peRatio: 5.1 },
   { symbol: "EFERT.KA", name: "Engro Fertilizers Ltd.", sector: "Fertilizer", marketCap: 210, peRatio: 5.5 },
 
   // ---- Chemicals ----
   { symbol: "COLG.KA", name: "Colgate-Palmolive Pakistan", sector: "Chemicals", marketCap: 85, peRatio: 18.5 },
-  { symbol: "ICI.KA", name: "ICI Pakistan", sector: "Chemicals", marketCap: 80, peRatio: 12.2 },
+  { symbol: "LCI.KA", name: "Lucky Core Industries (ex-ICI)", sector: "Chemicals", marketCap: 80, peRatio: 12.2 },
   { symbol: "LOTCHEM.KA", name: "Lotte Chemical Pakistan", sector: "Chemicals", marketCap: 55, peRatio: 7.8 },
   { symbol: "EPCL.KA", name: "Engro Polymer & Chemicals", sector: "Chemicals", marketCap: 42, peRatio: 6.5 },
   { symbol: "AGL.KA", name: "Agritech Ltd.", sector: "Chemicals", marketCap: 15, peRatio: null },
@@ -85,11 +84,10 @@ const KSE100_STOCKS = [
 
   // ---- Automobile ----
   { symbol: "INDU.KA", name: "Indus Motor Co.", sector: "Automobile", marketCap: 90, peRatio: 9.5 },
-  { symbol: "PSMC.KA", name: "Pak Suzuki Motor Co.", sector: "Automobile", marketCap: 28, peRatio: 18.5 },
   { symbol: "HCAR.KA", name: "Honda Atlas Cars Pakistan", sector: "Automobile", marketCap: 42, peRatio: 12.1 },
   { symbol: "ATLH.KA", name: "Atlas Honda Ltd.", sector: "Automobile", marketCap: 55, peRatio: 10.5 },
   { symbol: "GHNI.KA", name: "Ghandhara Industries", sector: "Automobile", marketCap: 20, peRatio: 8.2 },
-  { symbol: "GHNL.KA", name: "Ghandhara Nissan", sector: "Automobile", marketCap: 18, peRatio: 9.1 },
+  { symbol: "GAL.KA", name: "Ghandhara Automobiles (ex-Nissan)", sector: "Automobile", marketCap: 18, peRatio: 9.1 },
   { symbol: "SAZEW.KA", name: "Sazgar Engineering Works", sector: "Automobile", marketCap: 35, peRatio: 8.8 },
   { symbol: "AGIL.KA", name: "Agriauto Industries", sector: "Automobile", marketCap: 8, peRatio: 7.5 },
 
@@ -99,7 +97,6 @@ const KSE100_STOCKS = [
   { symbol: "ABOT.KA", name: "Abbott Laboratories Pak.", sector: "Pharmaceutical", marketCap: 58, peRatio: 14.5 },
   { symbol: "FEROZ.KA", name: "Ferozsons Laboratories", sector: "Pharmaceutical", marketCap: 25, peRatio: 10.2 },
   { symbol: "HINOON.KA", name: "Highnoon Laboratories", sector: "Pharmaceutical", marketCap: 18, peRatio: 8.5 },
-  { symbol: "OTSUKA.KA", name: "Otsuka Pakistan", sector: "Pharmaceutical", marketCap: 14, peRatio: 11.2 },
   { symbol: "AGP.KA", name: "AGP Ltd.", sector: "Pharmaceutical", marketCap: 25, peRatio: 9.8 },
 
   // ---- Technology ----
@@ -121,7 +118,6 @@ const KSE100_STOCKS = [
   { symbol: "RMPL.KA", name: "Rafhan Maize Products", sector: "Food & Beverages", marketCap: 55, peRatio: 28.2 },
   { symbol: "CLOV.KA", name: "Clover Pakistan", sector: "Food & Beverages", marketCap: 8, peRatio: null },
   { symbol: "BATA.KA", name: "Bata Pakistan", sector: "Personal Care & Leather", marketCap: 15, peRatio: 12.5 },
-  { symbol: "ULEVER.KA", name: "Unilever Pakistan", sector: "Personal Care & Leather", marketCap: 220, peRatio: 42.0 },
   { symbol: "TREET.KA", name: "Treet Corporation", sector: "Personal Care & Leather", marketCap: 20, peRatio: 8.5 },
 
   // ---- Engineering & Industrial ----
@@ -141,12 +137,11 @@ const KSE100_STOCKS = [
   // ---- Miscellaneous ----
   { symbol: "PIBTL.KA", name: "Pakistan Intl. Bulk Terminal", sector: "Transport", marketCap: 18, peRatio: 6.5 },
   { symbol: "PNSC.KA", name: "Pakistan National Shipping", sector: "Transport", marketCap: 15, peRatio: 5.2 },
-  { symbol: "PIAA.KA", name: "PIA Holding Co.", sector: "Transport", marketCap: 12, peRatio: null },
+  { symbol: "PIAHCLA.KA", name: "PIA Holding Co. (A)", sector: "Transport", marketCap: 12, peRatio: null },
   { symbol: "DCL.KA", name: "Dolmen City REIT", sector: "Real Estate", marketCap: 35, peRatio: 8.5 },
   { symbol: "JVDC.KA", name: "Javedan Corporation", sector: "Real Estate", marketCap: 12, peRatio: 12.2 },
   { symbol: "TPLP.KA", name: "TPL Properties", sector: "Real Estate", marketCap: 15, peRatio: 11.0 },
   { symbol: "GRYL.KA", name: "Grays Leasing", sector: "Leasing", marketCap: 5, peRatio: null },
-  { symbol: "SPLC.KA", name: "Saudi Pak Leasing", sector: "Leasing", marketCap: 5, peRatio: null },
 ];
 
 // Map for quick lookup

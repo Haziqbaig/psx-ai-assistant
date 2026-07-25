@@ -8,7 +8,7 @@ const App = (() => {
   'use strict';
 
   // ---- Constants ----
-  const DEFAULT_WATCHLIST = ['ENGRO.KA','HUBC.KA','LUCK.KA','MEBL.KA','SYS.KA','FFC.KA','OGDC.KA','MCB.KA'];
+  const DEFAULT_WATCHLIST = ['ENGROH.KA','HUBC.KA','LUCK.KA','MEBL.KA','SYS.KA','FFC.KA','OGDC.KA','MCB.KA'];
   const IND_DAYS = 260;  // ~1 year of trading days
   const REFRESH_INTERVAL = 2 * 60 * 1000; // 2 minutes
   const CLOCK_INTERVAL = 30 * 1000;       // 30 seconds

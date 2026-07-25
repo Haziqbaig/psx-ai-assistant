@@ -79,19 +79,10 @@ const API = (() => {
       // fall through to proxy
     }
 
-    // 2. Last-resort CORS proxy (allorigins /get — returns {contents:"..."})
-    try {
-      const proxyUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(url);
-      const res = await fetch(proxyUrl, { cache: 'no-store' });
-      if (!res.ok) throw new Error('proxy HTTP ' + res.status);
-      const outer = await res.json();
-      if (outer && typeof outer.contents === 'string') {
-        return JSON.parse(outer.contents);
-      }
-      throw new Error('bad proxy wrap');
-    } catch (e) {
-      throw e;
-    }
+    // 2. Last resort: shared multi-proxy helper (8s timeout per proxy,
+    //    dead proxies remembered for the session — no 20s stalls)
+    const text = await proxyFetchText(url);
+    return JSON.parse(text);
   }
 
   // ════════════════════════════════════════
@@ -195,10 +186,53 @@ const API = (() => {
     return data;
   }
 
+  /** Map app symbols to PSX portal symbols: 'OGDC.KA' → 'OGDC', '^KSE' → 'KSE100'. */
+  function psxSymbol(symbol) {
+    if (symbol === '^KSE' || symbol === 'KSE100') return 'KSE100';
+    return symbol.replace(/\.KA$/, '');
+  }
+
+  /**
+   * PSX official EOD timeseries → chart shape. ~5 years of daily closes
+   * ([ts, close, volume, open] newest-first) — plenty for charts + indicators.
+   */
+  async function psxEodChart(symbol, lookbackDays = 250) {
+    const psym = psxSymbol(symbol);
+    const cacheKey = 'psx_eod_' + psym;
+    let rows = readCache(cacheKey, LONG_TTL);
+    if (!rows) {
+      const text = await proxyFetchText(`${PSX_DPS}/timeseries/eod/${psym}`);
+      const json = JSON.parse(text);
+      rows = json?.data;
+      if (!Array.isArray(rows) || !rows.length) throw new Error('no PSX eod data for ' + psym);
+      writeCache(cacheKey, rows);
+    }
+    const asc = rows.slice().reverse().slice(-Math.max(lookbackDays, 30));
+    const prices = asc.map(r => [r[0] * 1000, r[1]]);
+    const last = asc[asc.length - 1];
+    const prev = asc[asc.length - 2];
+    return {
+      prices,
+      total_volumes: asc.map(r => [r[0] * 1000, r[2] || 0]),
+      candles: asc.map(r => ({ t: r[0] * 1000, o: r[3] ?? r[1], h: Math.max(r[1], r[3] ?? r[1]), l: Math.min(r[1], r[3] ?? r[1]), c: r[1] })),
+      meta: {
+        price: last[1], currency: 'PKR',
+        name: psym === 'KSE100' ? 'KSE-100 Index' : psym,
+        previousClose: prev ? prev[1] : null,
+        exchangeName: 'PSX', timezone: 'PKT', gmtoffset: 18000,
+      },
+    };
+  }
+
   // ---- Build v8 chart URL ----
   function chartUrl(symbol, range, interval) {
     const host = YH_PRIMARY; // query1 is most reliable
     return `${host}/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&includePrePost=false`;
+  }
+
+  /** Approximate lookback days for a Yahoo range string (for PSX EOD fallback). */
+  function rangeToDays(range) {
+    return { '1d': 2, '5d': 7, '1mo': 31, '3mo': 92, '6mo': 183, '1y': 365, '2y': 730, '5y': 1825, 'max': 10000 }[range] || 92;
   }
 
   // ════════════════════════════════════════════
@@ -300,6 +334,13 @@ const API = (() => {
           // Return stale cache if available
           const stale = readCache(cacheKey, Infinity, true);
           if (stale) return stale;
+          // Yahoo dead → PSX official EOD (daily closes; intraday granularity
+          // isn't available, but a daily chart beats an error card)
+          try {
+            const psx = await psxEodChart(symbol, rangeToDays(range));
+            writeCache(cacheKey, psx);
+            return psx;
+          } catch (_) { /* PSX also unavailable */ }
           throw e;
         }
       }
