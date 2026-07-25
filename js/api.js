@@ -11,10 +11,22 @@ const API = (() => {
   const YH_FALLBACK = 'https://query2.finance.yahoo.com/v8/finance/chart';
 
   const CACHE_PREFIX = 'ss_cache_';
-  const SNAPSHOT_TTL  = 60_000;  // 60s for snapshots
   const INTRADAY_TTL   = 120_000; // 2 min for 1D/5D charts
   const LONG_TTL       = 600_000; // 10 min for daily/weekly charts
   const CONCURRENCY     = 8;       // parallel chart requests for snapshot pool
+
+  // ---- PSX market hours (PKT = UTC+5), Mon–Fri ~9:15–16:30 ----
+  function isMarketOpen() {
+    const pkt = new Date(Date.now() + 5 * 3600_000);
+    const day = pkt.getUTCDay();
+    if (day === 0 || day === 6) return false; // Sun/Sat
+    const mins = pkt.getUTCHours() * 60 + pkt.getUTCMinutes();
+    return mins >= 9 * 60 + 15 && mins <= 16 * 60 + 30;
+  }
+
+  // Snapshots change every minute while trading — but not at all when the
+  // market is closed. Cache accordingly (60s open / 6h closed).
+  function snapshotTtl() { return isMarketOpen() ? 60_000 : 21_600_000; }
 
   // Track whether v7 batch was tried and failed — skip it for the rest of the session
   let v7BatchDead = false;
@@ -52,7 +64,7 @@ const API = (() => {
    * IMPORTANT: Do NOT set User-Agent header — browsers FORBID it. The
    * browser sends its own real UA, which Yahoo accepts.
    */
-  async function robustFetch(url) {
+  async function robustFetch(url, { noProxy = false } = {}) {
     // 1. Try direct — browser auto-sends its real User-Agent, Yahoo accepts it
     try {
       const res = await fetch(url, { cache: 'no-store' });
@@ -61,8 +73,9 @@ const API = (() => {
         return json;
       }
       if (res.status === 429) throw new Error('rate-limited');
+      throw new Error('HTTP ' + res.status);
     } catch (e) {
-      if (e.message === 'rate-limited') throw e;
+      if (e.message === 'rate-limited' || noProxy) throw e;
       // fall through to proxy
     }
 
@@ -259,9 +272,9 @@ const API = (() => {
    * @param {string[]} symbols
    * @param {function} [onBatch] - optional callback(partialResult) after each batch completes
    */
-  async function v8SnapshotPool(symbols, onBatch) {
+  async function v8SnapshotPool(symbols, onBatch, seed = null) {
     const cacheKey = 'v8snap_' + [...symbols].sort().join(',');
-    const fresh = readCache(cacheKey, SNAPSHOT_TTL);
+    const fresh = readCache(cacheKey, snapshotTtl());
     if (fresh) {
       if (onBatch) onBatch(fresh);
       return fresh;
@@ -279,12 +292,14 @@ const API = (() => {
         while (idx < symbols.length) {
           const sym = symbols[idx++];
           try {
+            // noProxy: a failing per-symbol proxy fallback costs ~20s each —
+            // far better to fail fast and keep the seed/spark value.
             const url = chartUrl(sym, '5d', '1d');
-            const json = await robustFetch(url);
+            const json = await robustFetch(url, { noProxy: true });
             const snap = chartToSnapshot(sym, json);
-            result[sym] = snap || { symbol: sym, name: sym, price: null, changePct: null, volume: null };
+            result[sym] = snap || seed?.[sym] || { symbol: sym, name: sym, price: null, changePct: null, volume: null };
           } catch (e) {
-            result[sym] = { symbol: sym, name: sym, price: null, changePct: null, volume: null, error: e.message };
+            result[sym] = seed?.[sym] || { symbol: sym, name: sym, price: null, changePct: null, volume: null, error: e.message };
           }
         }
       }
@@ -313,12 +328,66 @@ const API = (() => {
     return result;
   }
 
+  // ---- Spark batch: MANY symbols per request (vs 1 for v8 chart) ----
+  // v7/finance/spark accepts comma-separated symbols and returns per-symbol
+  // chart results — 111 stocks in ~5 requests instead of 111.
+  async function sparkSnapshots(symbols) {
+    const CHUNK = 25;
+    const chunks = [];
+    for (let i = 0; i < symbols.length; i += CHUNK) chunks.push(symbols.slice(i, i + CHUNK));
+    const out = {};
+    const settled = await Promise.allSettled(chunks.map(async chunk => {
+      const url = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(chunk.join(','))}&range=5d&interval=1d`;
+      const json = await robustFetch(url);
+      const results = json?.spark?.result || [];
+      for (const r of results) {
+        const resp = r?.response?.[0];
+        if (!resp) continue;
+        const snap = chartToSnapshot(r.symbol, { chart: { result: [resp] } });
+        if (snap) out[r.symbol] = snap;
+      }
+    }));
+    if (!Object.keys(out).length) {
+      const err = settled.find(s => s.status === 'rejected');
+      throw (err && err.reason) || new Error('spark empty');
+    }
+    return out;
+  }
+
   /**
-   * Snapshots for a list of symbols. Tries v7 batch once; falls back to v8 pool.
+   * Snapshots for a list of symbols.
+   * Order: fresh cache → stale-paint + spark batch (fast) → v7 batch → v8 pool.
+   * When the market is closed, spark data is final — no 111-request pool at all.
    * @param {function} [onBatch] - callback with partial result object after each batch
    */
   async function snapshots(symbols, onBatch) {
     if (!symbols.length) return {};
+    const cacheKey = 'v8snap_' + [...symbols].sort().join(',');
+
+    const fresh = readCache(cacheKey, snapshotTtl());
+    if (fresh) { if (onBatch) onBatch(fresh); return fresh; }
+
+    // Instant paint: show last-known data immediately while refreshing
+    const stale = readCache(cacheKey, Infinity, true);
+    if (stale && onBatch) onBatch(stale);
+
+    // Fast path: batched spark quotes (a handful of requests for all symbols)
+    let spark = null;
+    try {
+      spark = await sparkSnapshots(symbols);
+      // spark has no volume — carry volumes over from last-known data
+      if (stale) {
+        for (const s of Object.keys(spark)) {
+          if (spark[s].volume == null && stale[s]?.volume != null) spark[s].volume = stale[s].volume;
+        }
+      }
+      if (onBatch) onBatch(spark);
+      if (!isMarketOpen()) {
+        // Market closed: spark closes are final — skip the expensive pool
+        writeCache(cacheKey, spark);
+        return spark;
+      }
+    } catch (_) { /* spark unavailable — continue */ }
 
     // Try v7 batch exactly once per session
     if (!v7BatchDead) {
@@ -334,7 +403,7 @@ const API = (() => {
       v7BatchDead = true;
     }
 
-    return v8SnapshotPool(symbols, onBatch);
+    return v8SnapshotPool(symbols, onBatch, spark || stale);
   }
 
   /**
@@ -451,6 +520,7 @@ const API = (() => {
     snapshots,
     allSnapshots,
     kse100Index,
-    kse100IndexWithInterval
+    kse100IndexWithInterval,
+    isMarketOpen
   };
 })();

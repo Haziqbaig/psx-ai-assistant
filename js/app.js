@@ -241,6 +241,12 @@ const App = (() => {
     const idxCls = idxChange == null ? 'text-dim' : idxChange >= 0 ? 'text-emerald-400' : 'text-rose-400';
 
     main().innerHTML = `<div class="fade-in space-y-5">
+      <!-- Market status banner -->
+      <div class="flex items-center gap-2 text-xs ${API.isMarketOpen() ? 'text-emerald-400' : 'text-amber-400'}">
+        ${API.isMarketOpen()
+          ? '<span class="live-dot"></span> Market open — live PSX prices'
+          : '● Market closed — showing last close (PSX trades Mon–Fri 9:15–16:30 PKT)'}
+      </div>
       <!-- Stat Cards -->
       <div class="stats-grid">
         <div class="glass p-5 glass-hover">
