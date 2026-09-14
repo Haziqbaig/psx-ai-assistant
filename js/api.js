@@ -92,6 +92,34 @@ const API = (() => {
   // (corsproxy.io allows browser-origin requests on the free tier).
   // ════════════════════════════════════════
   const PSX_DPS = 'https://dps.psx.com.pk';
+
+  // ════════════════════════════════════════
+  // STATIC DATA BRANCH (primary source) — refreshed every 5 min by a GitHub
+  // Action (.github/workflows/psx-data.yml) that fetches dps.psx.com.pk
+  // server-side and force-pushes JSON to the `data` branch.
+  // raw.githubusercontent.com sends Access-Control-Allow-Origin: * — so the
+  // browser reads it directly. No CORS proxies, no Yahoo rate limits.
+  // ════════════════════════════════════════
+  const STATIC_BASE = 'https://raw.githubusercontent.com/Haziqbaig/psx-ai-assistant/data';
+  let staticDead = false; // one hard failure on the core file → skip static for the session
+
+  async function staticJson(file) {
+    if (staticDead) throw new Error('static source unavailable');
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      // cache-bust on a 5-min grid so CDN caching aligns with the refresh cadence
+      const bust = Math.floor(Date.now() / 300_000);
+      const res = await fetch(`${STATIC_BASE}/${file}?v=${bust}`, { signal: ctrl.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.json();
+    } catch (e) {
+      if (file === 'snapshots.json') staticDead = true; // core file gone → branch not set up
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const CORS_PROXIES = [
     (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -129,6 +157,14 @@ const API = (() => {
     const cacheKey = 'psx_mw';
     const fresh = readCache(cacheKey, snapshotTtl());
     if (fresh) return fresh;
+    // Primary: pre-fetched snapshots from the data branch (server-side, no CORS)
+    try {
+      const j = await staticJson('snapshots.json');
+      if (j?.snapshots && Object.keys(j.snapshots).length) {
+        writeCache(cacheKey, j.snapshots);
+        return j.snapshots;
+      }
+    } catch (_) { /* static unavailable — fall back to live proxy scrape */ }
     const html = await proxyFetchText(PSX_DPS + '/market-watch');
     const out = {};
     const rowRe = /<tr><td data-search="([A-Z0-9]+)"[\s\S]*?data-title="([^"]*)"[\s\S]*?<\/tr>/g;
@@ -166,8 +202,15 @@ const API = (() => {
     const cacheKey = 'psx_idx_' + indexName;
     const fresh = readCache(cacheKey, INTRADAY_TTL);
     if (fresh) return fresh;
-    const text = await proxyFetchText(`${PSX_DPS}/timeseries/int/${indexName}`);
-    const json = JSON.parse(text);
+    let json;
+    // Primary: pre-fetched intraday index from the data branch
+    try {
+      json = (await staticJson('kse100_int.json'))?.data;
+    } catch (_) { /* fall back to live proxy fetch */ }
+    if (!json?.data?.length) {
+      const text = await proxyFetchText(`${PSX_DPS}/timeseries/int/${indexName}`);
+      json = JSON.parse(text);
+    }
     const rows = (json?.data || []).slice().reverse(); // newest-first → oldest-first
     if (!rows.length) throw new Error('no index data');
     const prices = rows.map(r => [r[0] * 1000, r[1]]);
@@ -201,9 +244,15 @@ const API = (() => {
     const cacheKey = 'psx_eod_' + psym;
     let rows = readCache(cacheKey, LONG_TTL);
     if (!rows) {
-      const text = await proxyFetchText(`${PSX_DPS}/timeseries/eod/${psym}`);
-      const json = JSON.parse(text);
-      rows = json?.data;
+      // Primary: pre-fetched EOD series from the data branch
+      try {
+        rows = (await staticJson(`eod/${psym}.json`))?.data?.data;
+      } catch (_) { /* fall back to live proxy fetch */ }
+      if (!Array.isArray(rows) || !rows.length) {
+        const text = await proxyFetchText(`${PSX_DPS}/timeseries/eod/${psym}`);
+        const json = JSON.parse(text);
+        rows = json?.data;
+      }
       if (!Array.isArray(rows) || !rows.length) throw new Error('no PSX eod data for ' + psym);
       writeCache(cacheKey, rows);
     }
@@ -249,6 +298,21 @@ const API = (() => {
 
     const fresh = readCache(cacheKey, ttl);
     if (fresh) return fresh;
+
+    // Primary: PSX official data via the pre-fetched static branch.
+    // Daily-interval charts come from EOD series; Yahoo is only a fallback.
+    if (interval === '1d') {
+      try {
+        const psx = await psxEodChart(symbol, rangeToDays(range));
+        writeCache(cacheKey, psx);
+        return psx;
+      } catch (_) { /* static + proxies unavailable — try Yahoo below */ }
+    } else if (symbol === '^KSE' || symbol === 'KSE100') {
+      // Intraday index → PSX official intraday timeseries
+      try {
+        return await psxIndexChart('KSE100');
+      } catch (_) { /* fall through to Yahoo */ }
+    }
 
     // Retry once on failure
     for (let attempt = 0; attempt < 2; attempt++) {
