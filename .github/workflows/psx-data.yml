@@ -1,0 +1,50 @@
+name: PSX data refresh
+
+on:
+  schedule:
+    # PSX trading: Mon-Fri 09:15-16:30 PKT (= 04:15-11:30 UTC)
+    - cron: '*/5 4-11 * * 1-5'   # every 5 min during market hours
+    - cron: '45 11 * * 1-5'      # one run right after close (16:45 PKT)
+    - cron: '0 13 * * 1-5'       # post-close EOD sweep (18:00 PKT)
+  workflow_dispatch: {}          # manual trigger from the Actions tab
+
+concurrency:
+  group: psx-data
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore previous data branch (for EOD freshness check)
+        run: |
+          mkdir -p live
+          if git fetch origin data --depth 1 2>/dev/null; then
+            git --work-tree=live checkout origin/data -- . 2>/dev/null || true
+          fi
+
+      - name: Fetch PSX data
+        run: node scripts/fetch-data.mjs live
+
+      - name: Publish to data branch (single orphan commit, keeps repo small)
+        run: |
+          cd live
+          git init -q
+          git config user.name "psx-data-bot"
+          git config user.email "actions@github.com"
+          git checkout -q -b data
+          git add -A
+          git commit -q -m "PSX data $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
